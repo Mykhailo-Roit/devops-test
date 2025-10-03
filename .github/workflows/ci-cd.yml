@@ -2,7 +2,7 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, develop, "feature/test_job", "PR" ]
+    branches: [ main, develop, "feature/results"]
   pull_request:
     branches: [ main ]
   release:
