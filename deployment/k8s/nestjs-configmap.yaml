@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nestjs-config
+  namespace: nestjs-redis-app
+  labels:
+    app: nestjs-app
+    component: backend
+data:
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+  PORT: "3000"
+  NODE_ENV: "production"

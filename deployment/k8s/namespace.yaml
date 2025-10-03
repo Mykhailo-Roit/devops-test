@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nestjs-redis-app
+  labels:
+    name: nestjs-redis-app
+    app: nestjs-redis

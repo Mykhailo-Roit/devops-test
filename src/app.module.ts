@@ -8,6 +8,9 @@ import { RedisService } from './redis/redis.service';
 	imports: [
 		ConfigModule.forRoot({
 			isGlobal: true,
+			// envFilePath: ['.env.local', '.env'],
+			// cache: true,
+			expandVariables: true,
 		}),
 	],
 	controllers: [AppController],

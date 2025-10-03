@@ -1,0 +1,321 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, "feature/test_job", "PR" ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: nestjs-redis-app
+  K8S_NAMESPACE: nestjs-redis-app
+  SERVICE_NAME: nestjs-redis-app
+  REDIS_SECRET_NAME: redis-secret
+
+jobs:
+  # Job 1: Run tests and security checks
+  test:
+    name: Test & Security Scan
+    runs-on: ubuntu-latest
+    outputs:
+      lint-status: ${{ steps.lint.outcome }}
+      test-status: ${{ steps.test.outcome }}
+      coverage-status: ${{ steps.coverage.outcome }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v5
+      with:
+        node-version: '24'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run linter
+      id: lint
+      continue-on-error: true
+      run: npm run lint
+
+    - name: Run tests
+      id: test
+      continue-on-error: true
+      run: npm run test
+
+    - name: Generate test coverage
+      id: coverage
+      continue-on-error: true
+      run: npm run test:cov
+
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      if: steps.coverage.outcome == 'success'
+      with:
+        file: ./coverage/lcov.info
+        flags: unittests
+        name: codecov-umbrella
+
+    - name: Create test summary
+      if: always()
+      run: |
+        echo "# Test Results Summary 🧪" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Test Type | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+
+        # Lint status
+        if [ "${{ steps.lint.outcome }}" == "success" ]; then
+          echo "| Linter | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Linter | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Unit tests status
+        if [ "${{ steps.test.outcome }}" == "success" ]; then
+          echo "| Unit Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Unit Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Coverage status
+        if [ "${{ steps.coverage.outcome }}" == "success" ]; then
+          echo "| Coverage | ✅ Generated |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Coverage | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+
+
+  # Job 2: Build and push Docker image
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request'
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.set_version.outputs.version }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set version
+      id: set_version
+      run: |
+        ver="$(date +%Y%m%d-%H%M)"
+        echo "version=$ver" >> $GITHUB_OUTPUT
+        echo "version=$ver"
+
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          ${{ steps.set_version.outputs.version }}
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile
+        # platforms: linux/amd64,linux/arm64
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Job 3: Deploy to Kubernetes
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: build
+    # if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+
+    - name: Setup Helm
+      uses: azure/setup-helm@v4.3.0
+      with:
+        version: 'latest'
+
+
+    - name: Set k8s context
+      uses: azure/k8s-set-context@v4
+      with:
+        method: kubeconfig
+        kubeconfig: ${{ secrets.KUBECONFIG }}
+
+
+    - name: Deploy namespaces
+      uses: Azure/k8s-deploy@v5
+      with:
+        name: ${{ secrets.K8S_CLUSTER }}
+        action: deploy
+        strategy: basic
+        manifests: |
+          deployment/k8s/namespace.yaml
+
+    - name: Setup/Install Redis using Helm
+      run: |
+        # helm repo add bitnami https://charts.bitnami.com/bitnami
+        # helm repo update
+        helm upgrade --install redis oci://registry-1.docker.io/cloudpirates/redis \
+          --namespace ${{ env.K8S_NAMESPACE }} \
+          --set auth.enabled=true \
+          --set auth.password=${{ secrets.REDIS_PASSWORD }} \
+          --set persistence.size=1Gi \
+          --wait
+
+    - name: Setup secrets
+      uses: azure/k8s-create-secret@v5
+      with:
+        namespace: ${{ env.K8S_NAMESPACE }}
+        secret-type: "generic"
+        secret-name: ${{ env.REDIS_SECRET_NAME }}
+        string-data: |
+          {
+            "redis-password": "${{ secrets.REDIS_PASSWORD }}"
+          }
+
+    - name: Update deployment files with image
+      run: |
+        cd deployment/k8s
+
+        # Update nestjs-deployment.yaml directly with the correct image (without applying)
+        sed -i "s|image: nestjs-redis-app:latest|image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}|g" nestjs-deployment.yaml
+
+    - name: Deploy
+      uses: Azure/k8s-deploy@v5
+      with:
+        name: ${{ secrets.K8S_CLUSTER }}
+        action: deploy
+        strategy: basic
+        manifests: |
+          deployment/k8s/nestjs-configmap.yaml
+          deployment/k8s/nestjs-deployment.yaml
+          deployment/k8s/nestjs-service.yaml
+          deployment/k8s/nestjs-ingress.yaml
+          deployment/k8s/nestjs-hpa.yaml
+
+        # deployment/k8s/monitoring.yaml
+        # deployment/k8s/network-policy.yaml
+
+        images: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}
+        namespace: ${{ env.K8S_NAMESPACE }}
+        skip-tls-verify: true
+
+
+  # Job 4: Notify deployment status
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [test, build, deploy]
+    if: always()
+
+    steps:
+    - name: Create deployment summary
+      run: |
+        echo "# Pipeline Execution Summary 📊" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Test Type | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+
+        # Lint status
+        if [ "${{ needs.test.outputs.lint-status }}" == "success" ]; then
+          echo "| Linter | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Linter | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Unit tests status
+        if [ "${{ needs.test.outputs.test-status }}" == "success" ]; then
+          echo "| Unit Tests | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Unit Tests | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Coverage status
+        if [ "${{ needs.test.outputs.coverage-status }}" == "success" ]; then
+          echo "| Coverage | ✅ Generated |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Coverage | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Pipeline Status" >> $GITHUB_STEP_SUMMARY
+        echo "| Job | Result |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Test | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Deploy | ${{ needs.deploy.result }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+    - name: Notify success
+      if: needs.deploy.result == 'success'
+      run: |
+        echo "## 🚀 Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+        echo "**Image:** \`${{ needs.build.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Digest:** \`${{ needs.build.outputs.image-digest }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+
+    - name: Notify failure
+      if: needs.deploy.result == 'failure' || needs.build.result == 'failure'
+      run: |
+        echo "## ❌ Pipeline Failed!" >> $GITHUB_STEP_SUMMARY
+        # echo "**Test result:** ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Build result:** ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Deploy result:** ${{ needs.deploy.result }}" >> $GITHUB_STEP_SUMMARY
+
+    - name: Notify test warnings
+      if: |
+        needs.test.outputs.lint-status != 'success' ||
+        needs.test.outputs.test-status != 'success' ||
+        needs.test.outputs.coverage-status != 'success'
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## ⚠️ Test Warnings" >> $GITHUB_STEP_SUMMARY
+        echo "Some tests failed during execution. The pipeline continued, but please review and fix the issues." >> $GITHUB_STEP_SUMMARY

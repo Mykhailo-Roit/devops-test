@@ -1,0 +1,36 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nestjs-service-monitor
+  namespace: nestjs-redis-app
+  labels:
+    app: nestjs-app
+    component: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: nestjs-app
+      component: backend
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+    scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: redis-service-monitor
+  namespace: nestjs-redis-app
+  labels:
+    app: redis
+    component: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: redis
+      component: database
+  endpoints:
+  - port: redis
+    interval: 30s
+    scrapeTimeout: 10s
